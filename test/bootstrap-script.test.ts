@@ -842,6 +842,65 @@ describe("renderBootstrapScript", () => {
     ]);
   });
 
+  it("disables the Codex app sunset gate inside the browser shell", () => {
+    const harness = createBootstrapHarness();
+    const script = renderBootstrapScript({
+      sentryOptions: {
+        buildFlavor: "stable",
+        appVersion: "1",
+        buildNumber: "123",
+        codexAppSessionId: "session-id",
+      },
+      stylesheetHref: "/pocodex.css",
+      importIconSvg: '<svg viewBox="0 0 1 1"></svg>',
+    });
+
+    harness.run(script);
+    harness.run(`
+      class FakeStatsigClient {
+        constructor() {
+          this.getFeatureGate = (gateName) => this._getFeatureGateImpl(gateName);
+        }
+
+        checkGate(gateName) {
+          return this.getFeatureGate(gateName).value;
+        }
+
+        _getFeatureGateImpl(gateName) {
+          return {
+            name: gateName,
+            ruleID: "test-rule",
+            value: true,
+          };
+        }
+      }
+
+      Object.assign(window.__STATSIG__, { StatsigClient: FakeStatsigClient });
+      const client = new FakeStatsigClient();
+      window.__pocodexStatsigGateResults = {
+        sunsetCheck: client.checkGate("2929582856"),
+        otherCheck: client.checkGate("other-gate"),
+        sunsetFeatureGate: client.getFeatureGate("2929582856"),
+        otherFeatureGate: client.getFeatureGate("other-gate"),
+      };
+    `);
+
+    const results = Reflect.get(harness.windowObject, "__pocodexStatsigGateResults") as {
+      otherCheck: boolean;
+      otherFeatureGate: { value: boolean };
+      sunsetCheck: boolean;
+      sunsetFeatureGate: { value: boolean };
+    };
+
+    expect(results.sunsetCheck).toBe(false);
+    expect(results.sunsetFeatureGate).toMatchObject({
+      ruleID: "test-rule",
+      value: false,
+    });
+    expect(results.otherCheck).toBe(true);
+    expect(results.otherFeatureGate.value).toBe(true);
+  });
+
   it("offers reconnect and reload actions from the connection status overlay", async () => {
     const harness = createBootstrapHarness({
       mobile: true,

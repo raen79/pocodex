@@ -131,6 +131,7 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
   const HEARTBEAT_MONITOR_INTERVAL_MS = 5_000;
   const WAKE_GRACE_PERIOD_MS = 10_000;
   const RELOAD_REQUIRED_FAILURE_COUNT = 6;
+  const CODEX_APP_SUNSET_STATSIG_GATE_ID = "2929582856";
   const NON_TEXT_INPUT_TYPES = new Set([
     "button",
     "checkbox",
@@ -193,6 +194,7 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
   workspaceRootPickerHost.id = "pocodex-workspace-root-picker-host";
   workspaceRootPickerHost.hidden = true;
   document.documentElement.dataset.pocodex = "true";
+  installStatsigCompatibilityOverrides();
   getStoredToken();
   restoreStoredRouteIfNeeded();
   normalizeBrowserUrlForRefresh();
@@ -3476,6 +3478,89 @@ function bootstrapPocodexInBrowser(config: BootstrapScriptConfig): void {
 
   function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null;
+  }
+
+  function installStatsigCompatibilityOverrides(): void {
+    const windowRecord = window as unknown as Record<string, unknown>;
+    const globalRecord = globalThis as Record<string, unknown>;
+    const statsigGlobal = (
+      isRecord(windowRecord.__STATSIG__)
+        ? windowRecord.__STATSIG__
+        : isRecord(globalRecord.__STATSIG__)
+          ? globalRecord.__STATSIG__
+          : {}
+    ) as Record<string, unknown>;
+
+    let statsigClientConstructor = patchStatsigClientConstructor(statsigGlobal.StatsigClient);
+    try {
+      Object.defineProperty(statsigGlobal, "StatsigClient", {
+        configurable: true,
+        enumerable: true,
+        get: () => statsigClientConstructor,
+        set: (value) => {
+          statsigClientConstructor = patchStatsigClientConstructor(value);
+        },
+      });
+    } catch {
+      statsigGlobal.StatsigClient = statsigClientConstructor;
+    }
+
+    windowRecord.__STATSIG__ = statsigGlobal;
+    globalRecord.__STATSIG__ = statsigGlobal;
+  }
+
+  function patchStatsigClientConstructor(value: unknown): unknown {
+    if (typeof value !== "function") {
+      return value;
+    }
+
+    const prototype = (value as { prototype?: unknown }).prototype;
+    if (!isRecord(prototype) || prototype.__pocodexStatsigCompatibilityOverrides === true) {
+      return value;
+    }
+
+    const originalCheckGate = prototype.checkGate;
+    if (typeof originalCheckGate === "function") {
+      prototype.checkGate = function (
+        this: unknown,
+        gateName: unknown,
+        ...args: unknown[]
+      ): unknown {
+        if (isDisabledStatsigGate(gateName)) {
+          return false;
+        }
+        return originalCheckGate.apply(this, [gateName, ...args]);
+      };
+    }
+
+    const originalGetFeatureGateImpl = prototype._getFeatureGateImpl;
+    if (typeof originalGetFeatureGateImpl === "function") {
+      prototype._getFeatureGateImpl = function (
+        this: unknown,
+        gateName: unknown,
+        ...args: unknown[]
+      ): unknown {
+        const result = originalGetFeatureGateImpl.apply(this, [gateName, ...args]);
+        return isDisabledStatsigGate(gateName) ? withDisabledStatsigGateValue(result) : result;
+      };
+    }
+
+    prototype.__pocodexStatsigCompatibilityOverrides = true;
+    return value;
+  }
+
+  function isDisabledStatsigGate(gateName: unknown): boolean {
+    return gateName === CODEX_APP_SUNSET_STATSIG_GATE_ID;
+  }
+
+  function withDisabledStatsigGateValue(result: unknown): unknown {
+    if (!isRecord(result)) {
+      return result;
+    }
+    return {
+      ...result,
+      value: false,
+    };
   }
 
   function addWorkerSubscriber(workerName: string, callback: WorkerMessageListener): () => void {
